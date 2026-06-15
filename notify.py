@@ -2,21 +2,19 @@
 """
 North Devon Planning Notifications
 
-Strategy 1 (primary): Fetch the weekly planning report viewer from
-  my.northdevon.gov.uk using a real browser (Playwright).
-
-Strategy 2 (fallback): Fetch the latest GovDelivery bulletin email
-  that North Devon publishes to content.govdelivery.com.
+Strategy 1: Playwright fetch of the weekly viewer (my.northdevon.gov.uk).
+Strategy 2: GovDelivery bulletin – if it just links to the viewer, follow
+            that link with Playwright.
+Strategy 3: Direct date-range search of planning.northdevon.gov.uk.
 
 Applications within RADIUS_MILES of home (EX33 2LD, Braunton) trigger
-an email.  Seen application references are stored in state.json so you
-only get notified once per application.
+an email.  Seen references are stored in state.json (committed each run).
 
 Run manually:
     python notify.py
-    python notify.py --dry-run        # no email, no state update
+    python notify.py --dry-run        # print matches, skip email/state
     python notify.py --dump-html      # save raw HTML for debugging
-    python notify.py --days 14        # look back further (strategy 2 only)
+    python notify.py --strategy 3     # force direct portal search
 """
 
 import argparse
@@ -26,10 +24,11 @@ import re
 import smtplib
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from math import atan2, cos, radians, sin, sqrt
+from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -46,29 +45,34 @@ HOME_LON = -4.16247
 HOME_POSTCODE = "EX33 2LD"
 RADIUS_MILES = float(os.getenv("RADIUS_MILES", "1"))
 
-# Weekly planning report viewer (the URL North Devon emails you)
 VIEWER_URL = (
     "https://my.northdevon.gov.uk/service/Weekly_planning_report_viewer"
     "?fromemail=newly%20registered"
 )
 
-# GovDelivery account for North Devon (fallback)
-GOVDELIVERY_ACCOUNT = "UKNORTHDEVON"
-
-# Individual application base URL on the planning portal
 PLANNING_DISPLAY_URL = "https://planning.northdevon.gov.uk/Planning/Display/{ref}"
+PLANNING_SEARCH_URL  = "https://planning.northdevon.gov.uk/Planning/Search"
 
-STATE_FILE = "state.json"
+STATE_FILE   = "state.json"
 POSTCODES_IO = "https://api.postcodes.io/postcodes/{}"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b", re.IGNORECASE)
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+    "Accept-Language": "en-GB,en;q=0.9",
+}
 
 # ---------------------------------------------------------------------------
 # Distance
 # ---------------------------------------------------------------------------
 
 
-def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+def haversine_miles(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
     dlat, dlon = lat2 - lat1, lon2 - lon1
     a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
@@ -80,7 +84,7 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
 # ---------------------------------------------------------------------------
 
 
-def geocode_postcode(postcode: str) -> tuple[float | None, float | None]:
+def geocode_postcode(postcode):
     clean = postcode.strip().upper().replace(" ", "")
     try:
         r = requests.get(POSTCODES_IO.format(clean), timeout=10)
@@ -92,18 +96,13 @@ def geocode_postcode(postcode: str) -> tuple[float | None, float | None]:
     return None, None
 
 
-def geocode_nominatim(address: str) -> tuple[float | None, float | None]:
-    time.sleep(1)  # Nominatim rate limit: 1 req/s
-    params = {
-        "q": f"{address}, North Devon, UK",
-        "format": "json",
-        "limit": 1,
-        "countrycodes": "gb",
-    }
+def geocode_nominatim(address):
+    time.sleep(1)
+    params = {"q": f"{address}, North Devon, UK", "format": "json",
+              "limit": 1, "countrycodes": "gb"}
     try:
         r = requests.get(
-            NOMINATIM_URL,
-            params=params,
+            NOMINATIM_URL, params=params,
             headers={"User-Agent": "NorthDevonPlanningNotifier/1.0 rob@medberry.co.uk"},
             timeout=15,
         )
@@ -115,7 +114,7 @@ def geocode_nominatim(address: str) -> tuple[float | None, float | None]:
     return None, None
 
 
-def geocode_address(address: str) -> tuple[float | None, float | None]:
+def geocode_address(address):
     m = POSTCODE_RE.search(address)
     if m:
         lat, lon = geocode_postcode(m.group(0))
@@ -125,150 +124,131 @@ def geocode_address(address: str) -> tuple[float | None, float | None]:
 
 
 # ---------------------------------------------------------------------------
-# Parsing helpers (shared between both strategies)
+# HTML parsing (shared)
 # ---------------------------------------------------------------------------
 
+_DISPLAY_RE = re.compile(r"/[Dd]isplay/(\d{4,6})", re.IGNORECASE)
+_REF_RE     = re.compile(r"\b[789]\d{4}\b")   # 5-digit refs starting 7/8/9
 
-def _extract_ref_from_text(text: str) -> str | None:
-    """Try to find a North Devon planning reference in free text."""
-    # North Devon uses numeric IDs like 81617 or refs like 81617 / 73108
-    m = re.search(r"\b7\d{4}\b|\b8\d{4}\b", text)
+
+def _ref_from_text(text):
+    m = _REF_RE.search(text)
     return m.group(0) if m else None
 
 
-def parse_applications_from_html(html: str, source_label: str = "") -> list[dict]:
+def parse_applications_from_html(html, source_label=""):
     """
-    Parse planning applications out of an HTML page or email.
-
-    Tries several common patterns:
-     - /Planning/Display/<ref> links in href attributes  (most reliable)
-     - Table rows with ref / address / description columns
-     - <li> items with a reference and address
-     - Any element containing a recognisable planning reference
-
-    Returns a list of dicts: reference, address, description, url
+    Extract planning applications from HTML using four patterns (tried in order):
+    0. /Planning/Display/<N> in href attributes
+    1. Table rows
+    2. List items / divs / paragraphs containing a reference
+    3. Anchor link text matching a reference
     """
     soup = BeautifulSoup(html, "lxml")
-    applications: list[dict] = []
-    seen_refs: set[str] = set()
+    apps = []
+    seen = set()
 
-    # ---- Pattern 0: planning portal Display URLs embedded in hrefs ----
-    # Catches e.g. <a href=".../Planning/Display/80123">View</a>
-    _display_re = re.compile(r"/[Dd]isplay/(\d{4,6})", re.IGNORECASE)
+    # Pattern 0: hrefs containing /Display/<ref>
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
-        m = _display_re.search(href)
+        href = a["href"]
+        m = _DISPLAY_RE.search(href)
         if not m:
             continue
         ref = m.group(1)
-        if ref in seen_refs:
+        if ref in seen:
             continue
-        seen_refs.add(ref)
+        seen.add(ref)
         parent = a.parent
-        surrounding = parent.get_text(" ", strip=True) if parent else a.get_text(strip=True)
+        surrounding = parent.get_text(" ", strip=True)[:300] if parent else a.get_text(strip=True)
         url = href if href.startswith("http") else f"https://planning.northdevon.gov.uk{href}"
-        applications.append({
-            "reference": ref,
-            "address": surrounding[:300],
-            "description": "",
-            "url": url,
-            "source": source_label,
-        })
+        apps.append({"reference": ref, "address": surrounding, "description": "", "url": url, "source": source_label})
 
-    # ---- Pattern 1: table rows ----
+    # Pattern 1: table rows
     for table in soup.find_all("table"):
-        rows = table.find_all("tr")
-        for row in rows[1:]:  # skip header
+        for row in table.find_all("tr")[1:]:
             cells = row.find_all(["td", "th"])
             if len(cells) < 2:
                 continue
             texts = [c.get_text(strip=True) for c in cells]
-            ref = _extract_ref_from_text(texts[0]) or _extract_ref_from_text(
-                " ".join(texts)
-            )
-            if not ref or ref in seen_refs:
+            ref = _ref_from_text(texts[0]) or _ref_from_text(" ".join(texts))
+            if not ref or ref in seen:
                 continue
-            seen_refs.add(ref)
-            address = texts[1] if len(texts) > 1 else ""
-            description = texts[2] if len(texts) > 2 else ""
+            seen.add(ref)
             link = cells[0].find("a")
-            url = link.get("href", "") if link else PLANNING_DISPLAY_URL.format(ref=ref)
+            url = link["href"] if link else PLANNING_DISPLAY_URL.format(ref=ref)
             if url.startswith("/"):
-                url = "https://my.northdevon.gov.uk" + url
-            applications.append(
-                {
-                    "reference": ref,
-                    "address": address,
-                    "description": description,
-                    "url": url,
-                    "source": source_label,
-                }
-            )
+                url = "https://planning.northdevon.gov.uk" + url
+            apps.append({
+                "reference": ref,
+                "address": texts[1] if len(texts) > 1 else "",
+                "description": texts[2] if len(texts) > 2 else "",
+                "url": url,
+                "source": source_label,
+            })
 
-    # ---- Pattern 2: list items / divs with ref + address ----
-    if not applications:
+    # Pattern 2: list items / divs / paragraphs
+    if not apps:
         for item in soup.find_all(["li", "div", "p"]):
             text = item.get_text(" ", strip=True)
-            ref = _extract_ref_from_text(text)
-            if not ref or ref in seen_refs:
+            ref = _ref_from_text(text)
+            if not ref or ref in seen:
                 continue
-            seen_refs.add(ref)
+            seen.add(ref)
             link = item.find("a")
             url = ""
             if link:
                 url = link.get("href", "")
                 if url.startswith("/"):
-                    url = "https://my.northdevon.gov.uk" + url
-            applications.append(
-                {
-                    "reference": ref,
-                    "address": text[:200],
-                    "description": "",
-                    "url": url or PLANNING_DISPLAY_URL.format(ref=ref),
-                    "source": source_label,
-                }
-            )
+                    url = "https://planning.northdevon.gov.uk" + url
+            apps.append({
+                "reference": ref,
+                "address": text[:200],
+                "description": "",
+                "url": url or PLANNING_DISPLAY_URL.format(ref=ref),
+                "source": source_label,
+            })
 
-    # ---- Pattern 3: every hyperlink whose text looks like a reference ----
-    if not applications:
+    # Pattern 3: anchor text matching a reference
+    if not apps:
         for a in soup.find_all("a", href=True):
-            ref = _extract_ref_from_text(a.get_text(strip=True))
-            if ref and ref not in seen_refs:
-                seen_refs.add(ref)
-                parent_text = a.parent.get_text(" ", strip=True) if a.parent else ""
+            ref = _ref_from_text(a.get_text(strip=True))
+            if ref and ref not in seen:
+                seen.add(ref)
+                parent_text = a.parent.get_text(" ", strip=True)[:200] if a.parent else ""
                 url = a["href"]
                 if url.startswith("/"):
                     url = "https://planning.northdevon.gov.uk" + url
-                applications.append(
-                    {
-                        "reference": ref,
-                        "address": parent_text[:200],
-                        "description": "",
-                        "url": url,
-                        "source": source_label,
-                    }
-                )
+                apps.append({
+                    "reference": ref, "address": parent_text,
+                    "description": "", "url": url, "source": source_label,
+                })
 
-    return applications
+    return apps
+
+
+def _debug_snippet(label, html):
+    """Print first 3000 chars of HTML to stdout for GitHub Actions log visibility."""
+    snippet = html.replace("\n", " ").replace("\r", "")[:3000]
+    print(f"\n[DEBUG] {label} – first 3000 chars of HTML:\n{snippet}\n")
 
 
 # ---------------------------------------------------------------------------
-# Strategy 1: Playwright (real browser) fetch of the weekly viewer
+# Playwright helper
 # ---------------------------------------------------------------------------
 
 
-def fetch_via_playwright(dump_html: bool = False) -> list[dict]:
+def _playwright_fetch(url, label, login_url=None, dump_html=False, dump_name=None):
     """
-    Launch a headless Chromium browser and load the weekly planning
-    report viewer.  Requires: pip install playwright && playwright install chromium
+    Load *url* with a headless Chromium browser and return the page HTML.
+    If the browser lands on a login page, optionally attempt credentials.
+    Returns empty string on failure.
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print("[playwright] not installed – skipping strategy 1", file=sys.stderr)
-        return []
+        print(f"[{label}] playwright not installed – skipping", file=sys.stderr)
+        return ""
 
-    print("[strategy 1] Fetching weekly report via Playwright …")
     html = ""
     try:
         with sync_playwright() as pw:
@@ -281,53 +261,72 @@ def fetch_via_playwright(dump_html: bool = False) -> list[dict]:
                 locale="en-GB",
             )
             page = ctx.new_page()
-            page.goto(VIEWER_URL, wait_until="networkidle", timeout=30_000)
+            page.goto(url, wait_until="networkidle", timeout=45_000)
+            print(f"[{label}] landed on: {page.url}")
 
-            # If we land on a login page, try credentials
-            if page.url != VIEWER_URL and "login" in page.url.lower():
+            # Detect a login form (password input anywhere on page)
+            has_password = page.query_selector('input[type="password"]') is not None
+            if has_password:
                 username = os.getenv("PORTAL_USERNAME", "")
                 password = os.getenv("PORTAL_PASSWORD", "")
                 if username and password:
-                    print("[strategy 1] Login page detected – attempting login …")
-                    page.fill('input[type="email"], input[name*="user"], input[name*="email"]', username)
-                    page.fill('input[type="password"]', password)
-                    page.click('button[type="submit"], input[type="submit"]')
-                    page.wait_for_load_state("networkidle", timeout=15_000)
-                    # Navigate back to the viewer after login
-                    page.goto(VIEWER_URL, wait_until="networkidle", timeout=30_000)
+                    print(f"[{label}] Login form detected – attempting login")
+                    try:
+                        page.fill('input[type="email"], input[name*="user"], input[name*="email"], input[type="text"]', username)
+                        page.fill('input[type="password"]', password)
+                        page.click('button[type="submit"], input[type="submit"]')
+                        page.wait_for_load_state("networkidle", timeout=20_000)
+                        print(f"[{label}] After login, landed on: {page.url}")
+                        if login_url and page.url != url:
+                            page.goto(url, wait_until="networkidle", timeout=30_000)
+                    except Exception as e:
+                        print(f"[{label}] Login attempt failed: {e}", file=sys.stderr)
                 else:
-                    print(
-                        "[strategy 1] Login required but no PORTAL_USERNAME/PORTAL_PASSWORD set",
-                        file=sys.stderr,
-                    )
+                    print(f"[{label}] Login form found but PORTAL_USERNAME/PASSWORD not set")
 
             html = page.content()
             browser.close()
     except Exception as e:
-        print(f"[strategy 1] Playwright error: {e}", file=sys.stderr)
-        return []
+        print(f"[{label}] Playwright error: {e}", file=sys.stderr)
+        return ""
 
-    if dump_html:
-        with open("debug_strategy1.html", "w") as fh:
+    if dump_html and dump_name:
+        with open(dump_name, "w") as fh:
             fh.write(html)
-        print("[strategy 1] HTML saved to debug_strategy1.html")
+        print(f"[{label}] HTML saved to {dump_name}")
 
+    return html
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1: weekly viewer via Playwright
+# ---------------------------------------------------------------------------
+
+
+def fetch_via_viewer(dump_html=False):
+    print("[strategy 1] Loading weekly viewer via Playwright …")
+    html = _playwright_fetch(
+        VIEWER_URL,
+        label="strategy 1",
+        login_url=VIEWER_URL,
+        dump_html=dump_html,
+        dump_name="debug_strategy1.html",
+    )
+    if not html:
+        return []
     apps = parse_applications_from_html(html, source_label="viewer")
     print(f"[strategy 1] Parsed {len(apps)} application(s)")
     if not apps:
-        snippet = html.replace("\n", " ").replace("\r", "")[:3000]
-        print(f"[strategy 1] Viewer HTML excerpt (first 3000 chars):\n{snippet}", file=sys.stderr)
+        _debug_snippet("strategy 1 viewer", html)
     return apps
 
 
 # ---------------------------------------------------------------------------
-# Strategy 2: GovDelivery bulletin
+# Strategy 2: GovDelivery bulletin → follow viewer link
 # ---------------------------------------------------------------------------
 
-# Known bulletin hex IDs from search results (most recent first).
-# The script tries these and any IDs it can find by searching forward.
 _KNOWN_BULLETIN_IDS = [
-    "3daba2e",  # "Recently registered planning applications Update" (~2025)
+    "3daba2e",  # Recently registered planning applications Update (~Apr 2025)
     "3b48b71",  # 06 Sep 2024 recently registered
     "39efbdb",  # 24 May 2024 recently registered
     "3863cc4",  # 19 Jan 2024 recently registered
@@ -336,22 +335,9 @@ _KNOWN_BULLETIN_IDS = [
 
 _GOVDELIVERY_BASE = "https://content.govdelivery.com/accounts/UKNORTHDEVON/bulletins/{}"
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-    "Accept-Language": "en-GB,en;q=0.9",
-}
 
-
-def _bulletin_url(hex_id: str) -> str:
-    return _GOVDELIVERY_BASE.format(hex_id)
-
-
-def _fetch_bulletin_html(hex_id: str) -> str | None:
-    url = _bulletin_url(hex_id)
+def _fetch_bulletin_html(hex_id):
+    url = _GOVDELIVERY_BASE.format(hex_id)
     try:
         r = requests.get(url, headers=_HEADERS, timeout=20)
         if r.ok and "planning" in r.text.lower():
@@ -361,42 +347,23 @@ def _fetch_bulletin_html(hex_id: str) -> str | None:
     return None
 
 
-def _find_latest_bulletin() -> tuple[str | None, str | None]:
+def _find_latest_bulletin():
     """
-    Return (hex_id, html) for the most recent 'newly registered' planning
-    bulletin we can reach.
-
-    Starts from the most recently known ID and searches forward
-    (incrementing by ~87 000 per week) for up to 200 weeks ahead.
-    Also falls back through the known list.
+    Return (hex_id, html) for the most recent 'recently/newly registered'
+    bulletin.  Searches a narrow window of ±3 weeks around the estimated
+    current bulletin ID, plus all known IDs as fallbacks.
     """
-    # Approximate GovDelivery-wide ID increment per week (empirically ~87 000)
     WEEK_INCREMENT = 87_000
-    MAX_WEEKS_AHEAD = 200
 
-    # Start point: most recent known ID
-    start_hex = _KNOWN_BULLETIN_IDS[0]
-    start_int = int(start_hex, 16)
-
-    # Estimate how many weeks have passed since the start point (~Apr 2025)
-    # so we jump close to the current week first
+    start_int  = int(_KNOWN_BULLETIN_IDS[0], 16)
     start_date = datetime(2025, 4, 1)
     weeks_elapsed = max(0, int((datetime.now() - start_date).days / 7))
+    estimate = start_int + weeks_elapsed * WEEK_INCREMENT
 
-    candidates: list[int] = []
-
-    # Look around the estimated current position
-    for offset in range(-4, MAX_WEEKS_AHEAD):
-        w = weeks_elapsed + offset
-        if w < 0:
-            continue
-        candidates.append(start_int + w * WEEK_INCREMENT)
-
-    # Also add all known IDs
+    # Narrow window: ±3 weeks around estimate + all known IDs
+    candidates = [estimate + offset * WEEK_INCREMENT for offset in range(-3, 4)]
     for known in _KNOWN_BULLETIN_IDS:
-        candidates.insert(0, int(known, 16))
-
-    # Remove duplicates and sort descending (newest first)
+        candidates.append(int(known, 16))
     candidates = sorted(set(candidates), reverse=True)
 
     for cand_int in candidates:
@@ -404,9 +371,8 @@ def _find_latest_bulletin() -> tuple[str | None, str | None]:
         print(f"[strategy 2] Trying bulletin {hex_id} …")
         html = _fetch_bulletin_html(hex_id)
         if html:
-            # Confirm it mentions registered (not decided) applications
             lower = html.lower()
-            if any(phrase in lower for phrase in (
+            if any(p in lower for p in (
                 "newly registered", "newly+registered",
                 "recently registered", "recently+registered",
             )):
@@ -417,31 +383,131 @@ def _find_latest_bulletin() -> tuple[str | None, str | None]:
     return None, None
 
 
-def fetch_via_govdelivery(
-    days_back: int = 14, dump_html: bool = False
-) -> list[dict]:
-    """Fetch the latest North Devon 'newly registered' GovDelivery bulletin."""
-    print("[strategy 2] Searching GovDelivery bulletins …")
-    hex_id, html = _find_latest_bulletin()
+def _extract_northdevon_links(html):
+    """Return all unique northdevon.gov.uk links from a bulletin."""
+    soup = BeautifulSoup(html, "lxml")
+    links = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "northdevon.gov.uk" in href and href not in seen:
+            seen.add(href)
+            links.append(href)
+    return links
 
-    if not html:
-        print("[strategy 2] Could not find a recent bulletin", file=sys.stderr)
+
+def fetch_via_govdelivery(dump_html=False):
+    print("[strategy 2] Searching GovDelivery bulletins …")
+    hex_id, bulletin_html = _find_latest_bulletin()
+
+    if not bulletin_html:
+        print("[strategy 2] Could not find a recent bulletin")
         return []
 
     if dump_html:
         fname = f"debug_bulletin_{hex_id}.html"
         with open(fname, "w") as fh:
-            fh.write(html)
-        print(f"[strategy 2] HTML saved to {fname}")
+            fh.write(bulletin_html)
+        print(f"[strategy 2] Bulletin HTML saved to {fname}")
 
-    apps = parse_applications_from_html(
-        html, source_label=f"bulletin/{hex_id}"
+    # Try parsing applications directly from the bulletin
+    apps = parse_applications_from_html(bulletin_html, source_label=f"bulletin/{hex_id}")
+    print(f"[strategy 2] Parsed {len(apps)} application(s) directly from bulletin")
+
+    if apps:
+        return apps
+
+    # Bulletin probably just links to the viewer – extract those links and
+    # load each with Playwright
+    nd_links = _extract_northdevon_links(bulletin_html)
+    print(f"[strategy 2] Bulletin contains {len(nd_links)} northdevon.gov.uk link(s): {nd_links}")
+
+    if not nd_links:
+        _debug_snippet(f"bulletin/{hex_id}", bulletin_html)
+        return []
+
+    for link_url in nd_links:
+        print(f"[strategy 2] Loading bulletin link via Playwright: {link_url}")
+        html = _playwright_fetch(
+            link_url,
+            label="strategy 2 link",
+            login_url=link_url,
+            dump_html=dump_html,
+            dump_name=f"debug_bulletin_link_{hex_id}.html",
+        )
+        if not html:
+            continue
+        apps = parse_applications_from_html(html, source_label=f"bulletin-link/{hex_id}")
+        print(f"[strategy 2] Parsed {len(apps)} application(s) from link")
+        if apps:
+            return apps
+        _debug_snippet(f"bulletin link {link_url}", html)
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Strategy 3: direct search of planning.northdevon.gov.uk
+# ---------------------------------------------------------------------------
+
+
+def fetch_via_portal_search(days_back=7, dump_html=False):
+    """
+    Search the planning portal directly for applications registered in the
+    last *days_back* days.  Tries a plain GET first, falls back to Playwright.
+    """
+    today    = date.today()
+    from_dt  = today - timedelta(days=days_back)
+    date_fmt = "%d/%m/%Y"
+
+    params = {
+        "searchType": "Application",
+        "applicantname": "",
+        "apptype": "",
+        "sttype": "",
+        "status": "REGAPL",
+        "date1": from_dt.strftime(date_fmt),
+        "date2": today.strftime(date_fmt),
+        "ward": "",
+        "parish": "",
+        "district": "",
+        "sorter": "",
+        "submit.x": "31",
+        "submit.y": "11",
+    }
+
+    search_url = f"{PLANNING_SEARCH_URL}?{urlencode(params)}"
+    print(f"[strategy 3] Searching portal: {search_url}")
+
+    # Try requests first (fast, no JS needed if the portal renders server-side)
+    try:
+        r = requests.get(PLANNING_SEARCH_URL, params=params, headers=_HEADERS, timeout=20)
+        if r.ok and len(r.text) > 500:
+            if dump_html:
+                with open("debug_strategy3_requests.html", "w") as fh:
+                    fh.write(r.text)
+            apps = parse_applications_from_html(r.text, source_label="portal-search")
+            print(f"[strategy 3] requests: parsed {len(apps)} application(s)")
+            if apps:
+                return apps
+            _debug_snippet("strategy 3 requests", r.text)
+    except Exception as e:
+        print(f"[strategy 3] requests failed: {e}", file=sys.stderr)
+
+    # Playwright fallback
+    print("[strategy 3] Falling back to Playwright for portal search …")
+    html = _playwright_fetch(
+        search_url,
+        label="strategy 3",
+        dump_html=dump_html,
+        dump_name="debug_strategy3_playwright.html",
     )
-    print(f"[strategy 2] Parsed {len(apps)} application(s)")
+    if not html:
+        return []
+    apps = parse_applications_from_html(html, source_label="portal-search-pw")
+    print(f"[strategy 3] Playwright: parsed {len(apps)} application(s)")
     if not apps:
-        # Print a snippet so the GitHub Actions log shows what the bulletin contains
-        snippet = html.replace("\n", " ").replace("\r", "")[:3000]
-        print(f"[strategy 2] Bulletin excerpt (first 3000 chars):\n{snippet}", file=sys.stderr)
+        _debug_snippet("strategy 3 playwright", html)
     return apps
 
 
@@ -450,14 +516,14 @@ def fetch_via_govdelivery(
 # ---------------------------------------------------------------------------
 
 
-def load_seen() -> set[str]:
+def load_seen():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as fh:
             return set(json.load(fh).get("seen", []))
     return set()
 
 
-def save_seen(seen: set[str]) -> None:
+def save_seen(seen):
     with open(STATE_FILE, "w") as fh:
         json.dump(
             {
@@ -474,24 +540,24 @@ def save_seen(seen: set[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def send_email(applications: list[dict]) -> None:
-    smtp_host = os.environ["SMTP_HOST"]
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    email_from = os.environ["EMAIL_FROM"]
+def send_email(applications):
+    smtp_host     = os.environ["SMTP_HOST"]
+    smtp_port     = int(os.getenv("SMTP_PORT", "587"))
+    email_from    = os.environ["EMAIL_FROM"]
     email_password = os.environ["EMAIL_PASSWORD"]
-    email_to = os.getenv("EMAIL_TO", "rob@medberry.co.uk")
+    email_to      = os.getenv("EMAIL_TO", "rob@medberry.co.uk")
 
-    count = len(applications)
+    count   = len(applications)
     subject = (
         f"Planning alert: {count} new application{'s' if count != 1 else ''} "
         f"within {RADIUS_MILES:.0f} mile of {HOME_POSTCODE}"
     )
 
     text_lines = [subject, "=" * len(subject), ""]
-    html_rows = []
+    html_rows  = []
 
     for app in applications:
-        dist = app.get("distance_miles")
+        dist     = app.get("distance_miles")
         dist_str = f"{dist:.2f} miles" if dist is not None else "unknown"
         text_lines += [
             f"Reference : {app['reference']}",
@@ -511,7 +577,8 @@ def send_email(applications: list[dict]) -> None:
         )
 
     date_str = datetime.now().strftime("%d %B %Y")
-    html = f"""<!DOCTYPE html>
+    rows_html = "".join(html_rows)
+    html_body = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="font-family:Arial,sans-serif;color:#222">
 <h2 style="color:#1a5276">North Devon Planning Alert</h2>
@@ -525,7 +592,7 @@ def send_email(applications: list[dict]) -> None:
       <th>Reference</th><th>Address</th><th>Distance</th><th>Description</th>
     </tr>
   </thead>
-  <tbody>{"".join(html_rows)}</tbody>
+  <tbody>{rows_html}</tbody>
 </table>
 <p style="font-size:12px;color:#777;margin-top:20px">
   <a href="https://planning.northdevon.gov.uk/">North Devon Planning Portal</a>
@@ -534,10 +601,10 @@ def send_email(applications: list[dict]) -> None:
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = email_from
-    msg["To"] = email_to
+    msg["From"]    = email_from
+    msg["To"]      = email_to
     msg.attach(MIMEText("\n".join(text_lines), "plain", "utf-8"))
-    msg.attach(MIMEText(html, "html", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     with smtplib.SMTP(smtp_host, smtp_port) as srv:
         srv.ehlo()
@@ -545,7 +612,7 @@ def send_email(applications: list[dict]) -> None:
         srv.login(email_from, email_password)
         srv.sendmail(email_from, email_to, msg.as_string())
 
-    print(f"Email sent → {email_to}: {subject}")
+    print(f"Email sent -> {email_to}: {subject}")
 
 
 # ---------------------------------------------------------------------------
@@ -553,44 +620,43 @@ def send_email(applications: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="North Devon planning notifier")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print matches, skip email and state update")
-    parser.add_argument("--dump-html", action="store_true",
-                        help="Save raw HTML to files for debugging")
-    parser.add_argument("--days", type=int, default=7,
-                        help="Days to look back (GovDelivery strategy, default 7)")
-    parser.add_argument("--strategy", choices=["1", "2", "auto"], default="auto",
-                        help="1=Playwright viewer, 2=GovDelivery, auto=try both")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dump-html", action="store_true")
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument(
+        "--strategy",
+        choices=["1", "2", "3", "auto"],
+        default="auto",
+        help="1=viewer, 2=GovDelivery, 3=portal search, auto=try all",
+    )
     args = parser.parse_args()
 
     print(f"[{datetime.now().isoformat()}] North Devon planning check")
     print(f"  Home: {HOME_POSTCODE} ({HOME_LAT}, {HOME_LON})  radius: {RADIUS_MILES} mi")
     print()
 
-    all_apps: list[dict] = []
+    all_apps = []
 
     if args.strategy in ("1", "auto"):
-        all_apps = fetch_via_playwright(dump_html=args.dump_html)
+        all_apps = fetch_via_viewer(dump_html=args.dump_html)
 
     if not all_apps and args.strategy in ("2", "auto"):
-        all_apps = fetch_via_govdelivery(days_back=args.days, dump_html=args.dump_html)
+        all_apps = fetch_via_govdelivery(dump_html=args.dump_html)
+
+    if not all_apps and args.strategy in ("3", "auto"):
+        all_apps = fetch_via_portal_search(days_back=args.days, dump_html=args.dump_html)
 
     if not all_apps:
-        print("No applications fetched from either strategy.")
-        print(
-            "Tip: run with --dump-html and check debug_*.html to see what the "
-            "portal returned.  If the viewer requires login, set "
-            "PORTAL_USERNAME and PORTAL_PASSWORD secrets."
-        )
+        print("No applications found by any strategy.")
         sys.exit(0)
 
-    print(f"Fetched {len(all_apps)} application(s) total")
+    print(f"\nFetched {len(all_apps)} application(s) total")
 
-    seen = load_seen()
+    seen     = load_seen()
     new_seen = set(seen)
-    nearby: list[dict] = []
+    nearby   = []
 
     for app in all_apps:
         ref = app["reference"]
