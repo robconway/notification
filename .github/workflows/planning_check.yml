@@ -4,6 +4,20 @@ on:
   schedule:
     - cron: '0 8 * * 1'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (print matches, skip email)'
+        type: boolean
+        default: false
+      dump_html:
+        description: 'Save raw HTML to artifacts for debugging'
+        type: boolean
+        default: false
+      strategy:
+        description: 'Fetch strategy (1=viewer, 2=GovDelivery, 3=portal search, auto)'
+        type: choice
+        options: [auto, '1', '2', '3']
+        default: auto
 
 jobs:
   check-planning:
@@ -36,7 +50,23 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           PORTAL_USERNAME: ${{ secrets.PORTAL_USERNAME }}
           PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
-        run: python notify.py
+          RADIUS_MILES: ${{ vars.RADIUS_MILES || '1' }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "${{ inputs.dump_html }}" = "true" ]; then ARGS="$ARGS --dump-html"; fi
+          if [ -n "${{ inputs.strategy }}" ] && [ "${{ inputs.strategy }}" != "auto" ]; then
+            ARGS="$ARGS --strategy ${{ inputs.strategy }}"
+          fi
+          python notify.py $ARGS
+
+      - name: Upload debug HTML (if requested)
+        if: ${{ inputs.dump_html == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html
+          path: debug_*.html
+          if-no-files-found: ignore
 
       - name: Commit updated state
         run: |
