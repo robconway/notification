@@ -303,19 +303,36 @@ def _playwright_fetch(url, label, login_url=None, dump_html=False, dump_name=Non
 # ---------------------------------------------------------------------------
 
 
+def _dump_page_diagnostics(page, label):
+    """Print page text + links + buttons to log for debugging."""
+    try:
+        body_text = page.inner_text("body")
+        print(f"[{label}] page text (first 800): {body_text[:800]!r}")
+        all_links = page.query_selector_all("a[href]")
+        # Fixed: get_attribute takes only the attribute name, no default arg
+        link_sample = [(a.inner_text().strip()[:60], (a.get_attribute("href") or "")[:80])
+                       for a in all_links[:30]]
+        print(f"[{label}] links ({len(all_links)} total): {link_sample}")
+        all_buttons = page.query_selector_all("button, [role=tab], [role=button], input[type=submit]")
+        btn_sample = [b.inner_text().strip()[:60] for b in all_buttons[:20]]
+        print(f"[{label}] buttons/tabs ({len(all_buttons)} total): {btn_sample}")
+    except Exception as _e:
+        print(f"[{label}] diagnostic error: {_e}")
+
+
 def fetch_via_viewer(dump_html=False):
     """
-    The viewer at my.northdevon.gov.uk requires two clicks to show data:
-      1. Click the 'Newly registered' tab/button
-      2. Click the most recent date in the resulting list
-    Only then does the applications table appear.
+    Load the viewer at my.northdevon.gov.uk (no login required – data is public):
+      Step 0: Accept the Granicus cookie consent banner
+      Step 1: Click 'Newly registered' tab (if needed – URL param may pre-select it)
+      Step 2: Click the most recent date to load the applications table
     """
     print("[strategy 1] Loading weekly viewer via Playwright …")
 
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
     except ImportError:
-        print("[strategy 1] playwright not installed", file=sys.stderr)
+        print("[strategy 1] playwright not installed")
         return []
 
     html = ""
@@ -333,58 +350,56 @@ def fetch_via_viewer(dump_html=False):
             page.goto(VIEWER_URL, wait_until="networkidle", timeout=45_000)
             print(f"[strategy 1] landed on: {page.url}")
 
-            # Diagnostic: show what's on the page before we start clicking
-            try:
-                body_text = page.inner_text("body")
-                print(f"[strategy 1] page text (first 600): {body_text[:600]!r}")
-                all_links = page.query_selector_all("a[href]")
-                link_sample = [(a.inner_text().strip()[:60], a.get_attribute("href", "")[:80])
-                               for a in all_links[:25]]
-                print(f"[strategy 1] links on page ({len(all_links)} total): {link_sample}")
-                all_buttons = page.query_selector_all("button, [role=tab], [role=button]")
-                btn_sample = [b.inner_text().strip()[:60] for b in all_buttons[:15]]
-                print(f"[strategy 1] buttons/tabs ({len(all_buttons)} total): {btn_sample}")
-            except Exception as _e:
-                print(f"[strategy 1] diagnostic error: {_e}")
+            # Step 0: dismiss cookie consent banner (required before viewer is interactive)
+            _cookie_accepted = False
+            for cookie_sel in [
+                'button:has-text("Accept all")',
+                'button:has-text("Accept cookies")',
+                'button:has-text("Accept")',
+                'button:has-text("I agree")',
+                'button:has-text("Agree")',
+                'button:has-text("Got it")',
+                'button:has-text("OK")',
+                'a:has-text("Accept all")',
+                'a:has-text("Accept cookies")',
+                '[id*="cookie"] button',
+                '[class*="cookie"] button',
+            ]:
+                try:
+                    el = page.locator(cookie_sel).first
+                    if el.count() > 0 and el.is_visible(timeout=1000):
+                        el.click()
+                        time.sleep(0.8)
+                        print(f"[strategy 1] Accepted cookie consent via: {cookie_sel}")
+                        _cookie_accepted = True
+                        break
+                except Exception:
+                    continue
 
-            # Handle login if needed
-            if page.query_selector('input[type="password"]'):
-                username = os.getenv("PORTAL_USERNAME", "")
-                password = os.getenv("PORTAL_PASSWORD", "")
-                if username and password:
-                    print("[strategy 1] Login form detected – attempting login")
-                    try:
-                        page.fill(
-                            'input[type="email"], input[name*="user"], '
-                            'input[name*="email"], input[type="text"]',
-                            username,
-                        )
-                        page.fill('input[type="password"]', password)
-                        page.click('button[type="submit"], input[type="submit"]')
-                        page.wait_for_load_state("networkidle", timeout=20_000)
-                        print(f"[strategy 1] after login: {page.url}")
-                        page.goto(VIEWER_URL, wait_until="networkidle", timeout=30_000)
-                    except Exception as e:
-                        print(f"[strategy 1] login failed: {e}", file=sys.stderr)
-                else:
-                    print("[strategy 1] Login form found but PORTAL_USERNAME/PASSWORD not set")
+            if not _cookie_accepted:
+                print("[strategy 1] No cookie consent found (or already accepted)")
 
-            # Step 1: click the "Newly registered" tab / button / link
-            # Try several selector strategies
+            # Diagnostics: show page content after cookie handling
+            _dump_page_diagnostics(page, "strategy 1")
+
+            # Step 1: click the "Newly registered" tab
+            # IMPORTANT: avoid 'a:has-text("register")' — it matches the nav "Register" link
             _newly_clicked = False
             for sel in [
                 'text="Newly registered"',
-                'text="newly registered"',
                 'text="Recently registered"',
+                'text="newly registered"',
+                'text="recently registered"',
                 '[data-tab*="register" i]',
-                'a:has-text("register")',
-                'button:has-text("register")',
-                'li:has-text("Newly")',
-                'li:has-text("register")',
+                'a[href*="newly"]',
+                'a[href*="registered" i]',
+                'button:has-text("Newly")',
+                'button:has-text("registered")',
+                'li.active:has-text("register")',
             ]:
                 try:
                     el = page.locator(sel).first
-                    if el.count() and el.is_visible():
+                    if el.count() > 0 and el.is_visible(timeout=1000):
                         el.click()
                         page.wait_for_load_state("networkidle", timeout=10_000)
                         print(f"[strategy 1] Clicked 'Newly registered' via: {sel}")
@@ -394,41 +409,21 @@ def fetch_via_viewer(dump_html=False):
                     continue
 
             if not _newly_clicked:
-                print("[strategy 1] Could not find 'Newly registered' button – dumping links")
-                try:
-                    all_links = page.query_selector_all("a[href]")
-                    link_sample = [(a.inner_text().strip()[:60], a.get_attribute("href", "")[:80])
-                                   for a in all_links[:30]]
-                    print(f"[strategy 1] links after load ({len(all_links)}): {link_sample}")
-                except Exception:
-                    pass
+                print("[strategy 1] 'Newly registered' tab not found (URL param may have pre-selected it)")
 
-            # After clicking Newly registered, show what date options are available
-            if _newly_clicked:
-                try:
-                    time.sleep(1)
-                    post_click_text = page.inner_text("body")
-                    print(f"[strategy 1] page text after tab click (first 400): {post_click_text[:400]!r}")
-                    post_links = page.query_selector_all("a[href]")
-                    post_link_sample = [(a.inner_text().strip()[:60], a.get_attribute("href", "")[:80])
-                                        for a in post_links[:30]]
-                    print(f"[strategy 1] links after tab click ({len(post_links)}): {post_link_sample}")
-                except Exception:
-                    pass
-
-            # Step 2: click the first (most recent) date in the date list
+            # Step 2: click the first (most recent) date
+            # The viewer shows a list of week-dates; click the top one
             _date_clicked = False
             for sel in [
-                'ul li a',          # list of week dates as links
-                'ol li a',
+                'a[href*="date="]',
+                'a[href*="week="]',
+                'a[href*="report"]',
                 '.date-list a',
                 '.week-list a',
                 'table.calendar td a',
-                'a[href*="date"]',
-                'a[href*="week"]',
-                'button:has-text("2026")',
-                'button:has-text("2025")',
-                'li a:first-child',
+                # Year-based text matches — safe because date links will contain "2026" or "2025"
+                'a:has-text("2026")',
+                'a:has-text("2025")',
             ]:
                 try:
                     items = page.locator(sel)
@@ -442,12 +437,16 @@ def fetch_via_viewer(dump_html=False):
                     continue
 
             if not _date_clicked:
-                print("[strategy 1] Could not find a date to click – dumping page")
+                print("[strategy 1] Could not find a date to click")
+
+            # Diagnostics after all clicks
+            if _date_clicked or _newly_clicked:
+                _dump_page_diagnostics(page, "strategy 1 post-click")
 
             html = page.content()
             browser.close()
     except Exception as e:
-        print(f"[strategy 1] Playwright error: {e}", file=sys.stderr)
+        print(f"[strategy 1] Playwright error: {e}")
         return []
 
     if dump_html:
