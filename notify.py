@@ -378,6 +378,13 @@ def fetch_via_viewer(dump_html=False):
 
             if not _cookie_accepted:
                 print("[strategy 1] No cookie consent found (or already accepted)")
+            else:
+                # After accepting cookies the viewer content loads via JS — wait for it
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20_000)
+                except Exception:
+                    pass
+                time.sleep(1)  # extra buffer for any lazy-loaded content
 
             # Diagnostics: show page content after cookie handling
             _dump_page_diagnostics(page, "strategy 1")
