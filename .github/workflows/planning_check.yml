@@ -18,6 +18,10 @@ on:
         type: choice
         options: [auto, '1', '2', '3']
         default: auto
+      radius_miles:
+        description: 'Override radius in miles (leave blank to use RADIUS_MILES var)'
+        type: string
+        default: ''
 
 jobs:
   check-planning:
@@ -50,7 +54,7 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           PORTAL_USERNAME: ${{ secrets.PORTAL_USERNAME }}
           PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
-          RADIUS_MILES: ${{ vars.RADIUS_MILES || '1' }}
+          RADIUS_MILES: ${{ inputs.radius_miles || vars.RADIUS_MILES || '1' }}
         run: |
           ARGS=""
           if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
