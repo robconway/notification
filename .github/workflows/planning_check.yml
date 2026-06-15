@@ -60,12 +60,14 @@ jobs:
           fi
           python notify.py $ARGS
 
-      - name: Upload debug HTML (if requested)
+      - name: Upload debug artifacts (if requested)
         if: ${{ inputs.dump_html == true }}
         uses: actions/upload-artifact@v4
         with:
           name: debug-html
-          path: debug_*.html
+          path: |
+            debug_*.html
+            debug_*.png
           if-no-files-found: ignore
 
       - name: Commit updated state

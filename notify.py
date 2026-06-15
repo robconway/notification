@@ -303,17 +303,16 @@ def _playwright_fetch(url, label, login_url=None, dump_html=False, dump_name=Non
 # ---------------------------------------------------------------------------
 
 
-def _dump_page_diagnostics(page, label):
-    """Print page text + links + buttons to log for debugging."""
+def _dump_page_diagnostics(page_or_frame, label):
+    """Print page/frame text + links + buttons to log for debugging."""
     try:
-        body_text = page.inner_text("body")
+        body_text = page_or_frame.inner_text("body")
         print(f"[{label}] page text (first 800): {body_text[:800]!r}")
-        all_links = page.query_selector_all("a[href]")
-        # Fixed: get_attribute takes only the attribute name, no default arg
+        all_links = page_or_frame.query_selector_all("a[href]")
         link_sample = [(a.inner_text().strip()[:60], (a.get_attribute("href") or "")[:80])
                        for a in all_links[:30]]
         print(f"[{label}] links ({len(all_links)} total): {link_sample}")
-        all_buttons = page.query_selector_all("button, [role=tab], [role=button], input[type=submit]")
+        all_buttons = page_or_frame.query_selector_all("button, [role=tab], [role=button], input[type=submit]")
         btn_sample = [b.inner_text().strip()[:60] for b in all_buttons[:20]]
         print(f"[{label}] buttons/tabs ({len(all_buttons)} total): {btn_sample}")
     except Exception as _e:
@@ -322,10 +321,12 @@ def _dump_page_diagnostics(page, label):
 
 def fetch_via_viewer(dump_html=False):
     """
-    Load the viewer at my.northdevon.gov.uk (no login required – data is public):
+    Load the viewer at my.northdevon.gov.uk:
       Step 0: Accept the Granicus cookie consent banner
-      Step 1: Click 'Newly registered' tab (if needed – URL param may pre-select it)
-      Step 2: Click the most recent date to load the applications table
+      Step 1: Find the iframe that contains the form content (Granicus Self embeds
+              the form in a child frame; page.inner_text() doesn't capture it)
+      Step 2: Click 'Newly registered' tab inside the frame
+      Step 3: Click the most recent date inside the frame
     """
     print("[strategy 1] Loading weekly viewer via Playwright …")
 
@@ -350,7 +351,7 @@ def fetch_via_viewer(dump_html=False):
             page.goto(VIEWER_URL, wait_until="networkidle", timeout=45_000)
             print(f"[strategy 1] landed on: {page.url}")
 
-            # Step 0: dismiss cookie consent banner (required before viewer is interactive)
+            # Step 0: dismiss cookie consent banner
             _cookie_accepted = False
             for cookie_sel in [
                 'button:has-text("Accept all")',
@@ -378,19 +379,61 @@ def fetch_via_viewer(dump_html=False):
 
             if not _cookie_accepted:
                 print("[strategy 1] No cookie consent found (or already accepted)")
-            else:
-                # After accepting cookies the viewer content loads via JS — wait for it
+
+            # Wait for content (the form may be in an iframe that loads after cookies)
+            try:
+                page.wait_for_load_state("networkidle", timeout=20_000)
+            except Exception:
+                pass
+            time.sleep(2)
+
+            # Step 1: find the iframe containing the planning viewer content.
+            # Granicus Self embeds the actual form in a child frame; the outer
+            # page only shows the navigation shell.
+            all_frames = page.frames
+            print(f"[strategy 1] {len(all_frames)} frame(s) detected")
+            for i, fr in enumerate(all_frames):
                 try:
-                    page.wait_for_load_state("networkidle", timeout=20_000)
+                    fr_url = fr.url or "(blank)"
+                    try:
+                        fr_text = fr.inner_text("body")[:200]
+                    except Exception:
+                        fr_text = "(unreadable)"
+                    print(f"[strategy 1] frame[{i}]: url={fr_url!r} text={fr_text!r}")
+                except Exception as fe:
+                    print(f"[strategy 1] frame[{i}] error: {fe}")
+
+            # Identify which frame holds the viewer content
+            viewer_frame = None
+            for fr in all_frames:
+                try:
+                    text = fr.inner_text("body").lower()
+                    if any(kw in text for kw in [
+                        "planning", "registered", "application", "report", "section 1",
+                        "newly", "recently", "week", "date",
+                    ]):
+                        print(f"[strategy 1] Planning content found in frame: {fr.url!r}")
+                        viewer_frame = fr
+                        break
                 except Exception:
-                    pass
-                time.sleep(1)  # extra buffer for any lazy-loaded content
+                    continue
 
-            # Diagnostics: show page content after cookie handling
-            _dump_page_diagnostics(page, "strategy 1")
+            if viewer_frame is None:
+                print("[strategy 1] No viewer frame found – using main page")
 
-            # Step 1: click the "Newly registered" tab
-            # IMPORTANT: avoid 'a:has-text("register")' — it matches the nav "Register" link
+            target = viewer_frame or page
+
+            # Take a screenshot when debugging to see the actual rendered state
+            if dump_html:
+                try:
+                    page.screenshot(path="debug_strategy1_screenshot.png", full_page=True)
+                    print("[strategy 1] Screenshot saved to debug_strategy1_screenshot.png")
+                except Exception as se:
+                    print(f"[strategy 1] Screenshot failed: {se}")
+
+            _dump_page_diagnostics(target, "strategy 1 target")
+
+            # Step 2: click the "Newly registered" tab
             _newly_clicked = False
             for sel in [
                 'text="Newly registered"',
@@ -405,10 +448,13 @@ def fetch_via_viewer(dump_html=False):
                 'li.active:has-text("register")',
             ]:
                 try:
-                    el = page.locator(sel).first
+                    el = target.locator(sel).first
                     if el.count() > 0 and el.is_visible(timeout=1000):
                         el.click()
-                        page.wait_for_load_state("networkidle", timeout=10_000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=10_000)
+                        except Exception:
+                            pass
                         print(f"[strategy 1] Clicked 'Newly registered' via: {sel}")
                         _newly_clicked = True
                         break
@@ -418,8 +464,7 @@ def fetch_via_viewer(dump_html=False):
             if not _newly_clicked:
                 print("[strategy 1] 'Newly registered' tab not found (URL param may have pre-selected it)")
 
-            # Step 2: click the first (most recent) date
-            # The viewer shows a list of week-dates; click the top one
+            # Step 3: click the first (most recent) date
             _date_clicked = False
             for sel in [
                 'a[href*="date="]',
@@ -428,15 +473,17 @@ def fetch_via_viewer(dump_html=False):
                 '.date-list a',
                 '.week-list a',
                 'table.calendar td a',
-                # Year-based text matches — safe because date links will contain "2026" or "2025"
                 'a:has-text("2026")',
                 'a:has-text("2025")',
             ]:
                 try:
-                    items = page.locator(sel)
+                    items = target.locator(sel)
                     if items.count() > 0:
                         items.first.click()
-                        page.wait_for_load_state("networkidle", timeout=10_000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=10_000)
+                        except Exception:
+                            pass
                         print(f"[strategy 1] Clicked first date via: {sel}")
                         _date_clicked = True
                         break
@@ -446,11 +493,19 @@ def fetch_via_viewer(dump_html=False):
             if not _date_clicked:
                 print("[strategy 1] Could not find a date to click")
 
-            # Diagnostics after all clicks
             if _date_clicked or _newly_clicked:
-                _dump_page_diagnostics(page, "strategy 1 post-click")
+                _dump_page_diagnostics(target, "strategy 1 post-click")
 
-            html = page.content()
+            # Collect HTML from all frames so parse_applications_from_html
+            # can find content that lives in child frames
+            html_parts = []
+            for fr in all_frames:
+                try:
+                    html_parts.append(fr.content())
+                except Exception:
+                    pass
+            html = "\n".join(html_parts) if html_parts else page.content()
+
             browser.close()
     except Exception as e:
         print(f"[strategy 1] Playwright error: {e}")
