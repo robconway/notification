@@ -10,10 +10,15 @@ on:
         description: 'Dry run (print matches, skip email)'
         type: boolean
         default: false
-      days:
-        description: 'Days to look back'
-        type: number
-        default: 7
+      dump_html:
+        description: 'Save raw HTML to artifacts for debugging'
+        type: boolean
+        default: false
+      strategy:
+        description: 'Fetch strategy'
+        type: choice
+        options: [auto, '1', '2']
+        default: auto
 
 jobs:
   check-planning:
@@ -31,8 +36,11 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install chromium --with-deps
 
       - name: Run planning checker
         env:
@@ -41,16 +49,25 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          PORTAL_USERNAME: ${{ secrets.PORTAL_USERNAME }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
           RADIUS_MILES: ${{ vars.RADIUS_MILES || '1' }}
-          PLANNING_BASE: ${{ vars.PLANNING_BASE || 'https://planning.northdevon.gov.uk' }}
         run: |
           ARGS=""
           if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
-          if [ -n "${{ inputs.days }}" ]; then ARGS="$ARGS --days ${{ inputs.days }}"; fi
+          if [ "${{ inputs.dump_html }}" = "true" ]; then ARGS="$ARGS --dump-html"; fi
+          if [ -n "${{ inputs.strategy }}" ]; then ARGS="$ARGS --strategy ${{ inputs.strategy }}"; fi
           python notify.py $ARGS
 
+      - name: Upload debug HTML (if requested)
+        if: ${{ inputs.dump_html == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html
+          path: debug_*.html
+          if-no-files-found: ignore
+
       - name: Commit updated state
-        # Only runs when state.json actually changed (i.e. new applications were seen)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
