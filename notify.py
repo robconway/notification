@@ -333,6 +333,20 @@ def fetch_via_viewer(dump_html=False):
             page.goto(VIEWER_URL, wait_until="networkidle", timeout=45_000)
             print(f"[strategy 1] landed on: {page.url}")
 
+            # Diagnostic: show what's on the page before we start clicking
+            try:
+                body_text = page.inner_text("body")
+                print(f"[strategy 1] page text (first 600): {body_text[:600]!r}")
+                all_links = page.query_selector_all("a[href]")
+                link_sample = [(a.inner_text().strip()[:60], a.get_attribute("href", "")[:80])
+                               for a in all_links[:25]]
+                print(f"[strategy 1] links on page ({len(all_links)} total): {link_sample}")
+                all_buttons = page.query_selector_all("button, [role=tab], [role=button]")
+                btn_sample = [b.inner_text().strip()[:60] for b in all_buttons[:15]]
+                print(f"[strategy 1] buttons/tabs ({len(all_buttons)} total): {btn_sample}")
+            except Exception as _e:
+                print(f"[strategy 1] diagnostic error: {_e}")
+
             # Handle login if needed
             if page.query_selector('input[type="password"]'):
                 username = os.getenv("PORTAL_USERNAME", "")
@@ -380,7 +394,27 @@ def fetch_via_viewer(dump_html=False):
                     continue
 
             if not _newly_clicked:
-                print("[strategy 1] Could not find 'Newly registered' button – will dump page for inspection")
+                print("[strategy 1] Could not find 'Newly registered' button – dumping links")
+                try:
+                    all_links = page.query_selector_all("a[href]")
+                    link_sample = [(a.inner_text().strip()[:60], a.get_attribute("href", "")[:80])
+                                   for a in all_links[:30]]
+                    print(f"[strategy 1] links after load ({len(all_links)}): {link_sample}")
+                except Exception:
+                    pass
+
+            # After clicking Newly registered, show what date options are available
+            if _newly_clicked:
+                try:
+                    time.sleep(1)
+                    post_click_text = page.inner_text("body")
+                    print(f"[strategy 1] page text after tab click (first 400): {post_click_text[:400]!r}")
+                    post_links = page.query_selector_all("a[href]")
+                    post_link_sample = [(a.inner_text().strip()[:60], a.get_attribute("href", "")[:80])
+                                        for a in post_links[:30]]
+                    print(f"[strategy 1] links after tab click ({len(post_links)}): {post_link_sample}")
+                except Exception:
+                    pass
 
             # Step 2: click the first (most recent) date in the date list
             _date_clicked = False
@@ -534,21 +568,28 @@ def fetch_via_govdelivery(dump_html=False):
         return []
 
     for link_url in nd_links:
-        print(f"[strategy 2] Loading bulletin link via Playwright: {link_url}")
-        html = _playwright_fetch(
-            link_url,
-            label="strategy 2 link",
-            login_url=link_url,
-            dump_html=dump_html,
-            dump_name=f"debug_bulletin_link_{hex_id}.html",
-        )
-        if not html:
-            continue
-        apps = parse_applications_from_html(html, source_label=f"bulletin-link/{hex_id}")
-        print(f"[strategy 2] Parsed {len(apps)} application(s) from link")
+        print(f"[strategy 2] Loading bulletin link: {link_url}")
+        # If the link is the weekly viewer, use the interactive click sequence
+        if "weekly_planning_report_viewer" in link_url.lower() or \
+           "my.northdevon.gov.uk" in link_url.lower():
+            print("[strategy 2] Recognised viewer link – using interactive click sequence")
+            apps = fetch_via_viewer(dump_html=dump_html)
+        else:
+            html = _playwright_fetch(
+                link_url,
+                label="strategy 2 link",
+                login_url=link_url,
+                dump_html=dump_html,
+                dump_name=f"debug_bulletin_link_{hex_id}.html",
+            )
+            if not html:
+                continue
+            apps = parse_applications_from_html(html, source_label=f"bulletin-link/{hex_id}")
+            print(f"[strategy 2] Parsed {len(apps)} application(s) from link")
+            if not apps:
+                _debug_snippet(f"bulletin link {link_url}", html)
         if apps:
             return apps
-        _debug_snippet(f"bulletin link {link_url}", html)
 
     return []
 
@@ -561,7 +602,8 @@ def fetch_via_govdelivery(dump_html=False):
 def fetch_via_portal_search(days_back=7, dump_html=False):
     """
     Search the planning portal directly for applications registered in the
-    last *days_back* days.  Tries a plain GET first, falls back to Playwright.
+    last *days_back* days.  Uses a short connect timeout — if the host is
+    unreachable (geo-blocked from GitHub Actions) this fails fast.
     """
     today    = date.today()
     from_dt  = today - timedelta(days=days_back)
@@ -586,9 +628,9 @@ def fetch_via_portal_search(days_back=7, dump_html=False):
     search_url = f"{PLANNING_SEARCH_URL}?{urlencode(params)}"
     print(f"[strategy 3] Searching portal: {search_url}")
 
-    # Try requests first (fast, no JS needed if the portal renders server-side)
     try:
-        r = requests.get(PLANNING_SEARCH_URL, params=params, headers=_HEADERS, timeout=20)
+        # (connect_timeout=5s, read_timeout=20s) — fails fast if geo-blocked
+        r = requests.get(PLANNING_SEARCH_URL, params=params, headers=_HEADERS, timeout=(5, 20))
         if r.ok and len(r.text) > 500:
             if dump_html:
                 with open("debug_strategy3_requests.html", "w") as fh:
@@ -598,24 +640,13 @@ def fetch_via_portal_search(days_back=7, dump_html=False):
             if apps:
                 return apps
             _debug_snippet("strategy 3 requests", r.text)
+        else:
+            print(f"[strategy 3] HTTP {r.status_code} – skipping")
     except Exception as e:
-        print(f"[strategy 3] requests failed: {e}", file=sys.stderr)
-
-    # Playwright fallback
-    print("[strategy 3] Falling back to Playwright for portal search …")
-    html = _playwright_fetch(
-        search_url,
-        label="strategy 3",
-        dump_html=dump_html,
-        dump_name="debug_strategy3_playwright.html",
-    )
-    if not html:
+        print(f"[strategy 3] portal unreachable (likely geo-blocked from CI): {e}")
         return []
-    apps = parse_applications_from_html(html, source_label="portal-search-pw")
-    print(f"[strategy 3] Playwright: parsed {len(apps)} application(s)")
-    if not apps:
-        _debug_snippet("strategy 3 playwright", html)
-    return apps
+
+    return []
 
 
 # ---------------------------------------------------------------------------
