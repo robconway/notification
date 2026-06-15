@@ -232,6 +232,66 @@ def _debug_snippet(label, html):
     print(f"\n[DEBUG] {label} – first 3000 chars of HTML:\n{snippet}\n")
 
 
+def parse_viewer_text_applications(viewer_text, viewer_html):
+    """
+    Parse planning applications from the North Devon viewer iframe inner text.
+
+    The viewer produces structured text blocks separated by "Application Number:":
+      Application Number: 81832
+      Site Address:
+
+      Strand House, Braunton Road, Barnstaple, Devon, EX31 4AU
+
+      Description:
+
+      Listed Building Consent to regularise...
+
+    We pair those text blocks with the display URLs found in the iframe HTML.
+    """
+    # Collect /Planning/Display/<ref> URLs from the iframe HTML
+    soup = BeautifulSoup(viewer_html, "lxml")
+    app_urls = {}
+    for a in soup.find_all("a", href=True):
+        m = _DISPLAY_RE.search(a["href"])
+        if m:
+            ref = m.group(1)
+            if ref not in app_urls:
+                href = a["href"]
+                app_urls[ref] = (
+                    href if href.startswith("http")
+                    else "https://planning.northdevon.gov.uk" + href
+                )
+
+    apps = []
+    seen = set()
+    for part in re.split(r"Application Number:\s*", viewer_text)[1:]:
+        ref_m = re.match(r"(\d{4,6})", part.strip())
+        if not ref_m:
+            continue
+        ref = ref_m.group(1)
+        if ref in seen:
+            continue
+        seen.add(ref)
+
+        # Site address: text after "Site Address:" up to the next blank line
+        addr_m = re.search(r"Site Address:[^\n]*\n+(.*?)\n\n", part, re.DOTALL)
+        address = " ".join(addr_m.group(1).split()) if addr_m else ""
+
+        # Description: text after "Description:" up to the next blank line
+        desc_m = re.search(r"Description:[^\n]*\n+(.*?)\n\n", part, re.DOTALL)
+        desc = " ".join(desc_m.group(1).split()) if desc_m else ""
+
+        url = app_urls.get(ref, PLANNING_DISPLAY_URL.format(ref=ref))
+        apps.append({
+            "reference": ref,
+            "address": address,
+            "description": desc,
+            "url": url,
+            "source": "viewer",
+        })
+    return apps
+
+
 # ---------------------------------------------------------------------------
 # Playwright helper
 # ---------------------------------------------------------------------------
@@ -337,6 +397,8 @@ def fetch_via_viewer(dump_html=False):
         return []
 
     html = ""
+    viewer_text = ""
+    viewer_html_content = ""
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -496,8 +558,15 @@ def fetch_via_viewer(dump_html=False):
             if _date_clicked or _newly_clicked:
                 _dump_page_diagnostics(target, "strategy 1 post-click")
 
-            # Collect HTML from all frames so parse_applications_from_html
-            # can find content that lives in child frames
+            # Capture viewer frame text + HTML for the accurate text parser
+            if viewer_frame:
+                try:
+                    viewer_text = viewer_frame.inner_text("body")
+                    viewer_html_content = viewer_frame.content()
+                except Exception as ve:
+                    print(f"[strategy 1] Could not read viewer frame content: {ve}")
+
+            # Concatenate HTML from all frames for fallback HTML parser
             html_parts = []
             for fr in all_frames:
                 try:
@@ -516,8 +585,17 @@ def fetch_via_viewer(dump_html=False):
             fh.write(html)
         print("[strategy 1] HTML saved to debug_strategy1.html")
 
+    # Primary: text parser extracts accurate site addresses from the structured
+    # inner text the viewer iframe produces
+    if viewer_text:
+        apps = parse_viewer_text_applications(viewer_text, viewer_html_content)
+        print(f"[strategy 1] Parsed {len(apps)} application(s) via text parser")
+        if apps:
+            return apps
+
+    # Fallback: generic HTML parser
     apps = parse_applications_from_html(html, source_label="viewer")
-    print(f"[strategy 1] Parsed {len(apps)} application(s)")
+    print(f"[strategy 1] Parsed {len(apps)} application(s) via HTML parser")
     if not apps:
         _debug_snippet("strategy 1 viewer", html)
     return apps
