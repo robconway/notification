@@ -73,7 +73,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json
           if git diff --staged --quiet; then
-            echo "state.json unchanged – nothing to commit"
+            echo "state.json unchanged - nothing to commit"
           else
             git commit -m "chore: update seen-applications state [skip ci]"
             git pull --rebase origin main
