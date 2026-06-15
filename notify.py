@@ -299,21 +299,128 @@ def _playwright_fetch(url, label, login_url=None, dump_html=False, dump_name=Non
 
 
 # ---------------------------------------------------------------------------
-# Strategy 1: weekly viewer via Playwright
+# Strategy 1: weekly viewer via Playwright (with interactive clicks)
 # ---------------------------------------------------------------------------
 
 
 def fetch_via_viewer(dump_html=False):
+    """
+    The viewer at my.northdevon.gov.uk requires two clicks to show data:
+      1. Click the 'Newly registered' tab/button
+      2. Click the most recent date in the resulting list
+    Only then does the applications table appear.
+    """
     print("[strategy 1] Loading weekly viewer via Playwright …")
-    html = _playwright_fetch(
-        VIEWER_URL,
-        label="strategy 1",
-        login_url=VIEWER_URL,
-        dump_html=dump_html,
-        dump_name="debug_strategy1.html",
-    )
-    if not html:
+
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        print("[strategy 1] playwright not installed", file=sys.stderr)
         return []
+
+    html = ""
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                ),
+                locale="en-GB",
+            )
+            page = ctx.new_page()
+            page.goto(VIEWER_URL, wait_until="networkidle", timeout=45_000)
+            print(f"[strategy 1] landed on: {page.url}")
+
+            # Handle login if needed
+            if page.query_selector('input[type="password"]'):
+                username = os.getenv("PORTAL_USERNAME", "")
+                password = os.getenv("PORTAL_PASSWORD", "")
+                if username and password:
+                    print("[strategy 1] Login form detected – attempting login")
+                    try:
+                        page.fill(
+                            'input[type="email"], input[name*="user"], '
+                            'input[name*="email"], input[type="text"]',
+                            username,
+                        )
+                        page.fill('input[type="password"]', password)
+                        page.click('button[type="submit"], input[type="submit"]')
+                        page.wait_for_load_state("networkidle", timeout=20_000)
+                        print(f"[strategy 1] after login: {page.url}")
+                        page.goto(VIEWER_URL, wait_until="networkidle", timeout=30_000)
+                    except Exception as e:
+                        print(f"[strategy 1] login failed: {e}", file=sys.stderr)
+                else:
+                    print("[strategy 1] Login form found but PORTAL_USERNAME/PASSWORD not set")
+
+            # Step 1: click the "Newly registered" tab / button / link
+            # Try several selector strategies
+            _newly_clicked = False
+            for sel in [
+                'text="Newly registered"',
+                'text="newly registered"',
+                'text="Recently registered"',
+                '[data-tab*="register" i]',
+                'a:has-text("register")',
+                'button:has-text("register")',
+                'li:has-text("Newly")',
+                'li:has-text("register")',
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    if el.count() and el.is_visible():
+                        el.click()
+                        page.wait_for_load_state("networkidle", timeout=10_000)
+                        print(f"[strategy 1] Clicked 'Newly registered' via: {sel}")
+                        _newly_clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not _newly_clicked:
+                print("[strategy 1] Could not find 'Newly registered' button – will dump page for inspection")
+
+            # Step 2: click the first (most recent) date in the date list
+            _date_clicked = False
+            for sel in [
+                'ul li a',          # list of week dates as links
+                'ol li a',
+                '.date-list a',
+                '.week-list a',
+                'table.calendar td a',
+                'a[href*="date"]',
+                'a[href*="week"]',
+                'button:has-text("2026")',
+                'button:has-text("2025")',
+                'li a:first-child',
+            ]:
+                try:
+                    items = page.locator(sel)
+                    if items.count() > 0:
+                        items.first.click()
+                        page.wait_for_load_state("networkidle", timeout=10_000)
+                        print(f"[strategy 1] Clicked first date via: {sel}")
+                        _date_clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not _date_clicked:
+                print("[strategy 1] Could not find a date to click – dumping page")
+
+            html = page.content()
+            browser.close()
+    except Exception as e:
+        print(f"[strategy 1] Playwright error: {e}", file=sys.stderr)
+        return []
+
+    if dump_html:
+        with open("debug_strategy1.html", "w") as fh:
+            fh.write(html)
+        print("[strategy 1] HTML saved to debug_strategy1.html")
+
     apps = parse_applications_from_html(html, source_label="viewer")
     print(f"[strategy 1] Parsed {len(apps)} application(s)")
     if not apps:
