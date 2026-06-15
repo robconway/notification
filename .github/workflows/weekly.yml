@@ -1,0 +1,60 @@
+name: Weekly Planning Check
+
+on:
+  schedule:
+    # Every Monday at 08:00 UTC (09:00 BST / 08:00 GMT)
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (print matches, skip email)'
+        type: boolean
+        default: false
+      days:
+        description: 'Days to look back'
+        type: number
+        default: 7
+
+jobs:
+  check-planning:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to commit updated state.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run planning checker
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          RADIUS_MILES: ${{ vars.RADIUS_MILES || '1' }}
+          PLANNING_BASE: ${{ vars.PLANNING_BASE || 'https://planning.northdevon.gov.uk' }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "${{ inputs.days }}" ]; then ARGS="$ARGS --days ${{ inputs.days }}"; fi
+          python notify.py $ARGS
+
+      - name: Commit updated state
+        # Only runs when state.json actually changed (i.e. new applications were seen)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || \
+            git commit -m "chore: update seen-applications state [skip ci]"
+          git push origin HEAD
