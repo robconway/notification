@@ -41,7 +41,7 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-HOME_LAT = 51.10264     # EX33 2LD – Braunton, North Devon
+HOME_LAT = 51.10264     # EX33 2LD - Braunton, North Devon
 HOME_LON = -4.16247
 HOME_POSTCODE = "EX33 2LD"
 RADIUS_MILES = float(os.getenv("RADIUS_MILES", "1"))
@@ -131,7 +131,6 @@ def geocode_address(address: str) -> tuple[float | None, float | None]:
 
 def _extract_ref_from_text(text: str) -> str | None:
     """Try to find a North Devon planning reference in free text."""
-    # North Devon uses numeric IDs like 81617 or refs like 81617 / 73108
     m = re.search(r"\b7\d{4}\b|\b8\d{4}\b", text)
     return m.group(0) if m else None
 
@@ -139,13 +138,7 @@ def _extract_ref_from_text(text: str) -> str | None:
 def parse_applications_from_html(html: str, source_label: str = "") -> list[dict]:
     """
     Parse planning applications out of an HTML page or email.
-
-    Tries several common patterns:
-     - Table rows with ref / address / description columns
-     - <li> items with a reference and address
-     - Any element containing a recognisable planning reference
-
-    Returns a list of dicts: reference, address, description, url
+    Tries table rows, list items, and anchor links as fallback.
     """
     soup = BeautifulSoup(html, "lxml")
     applications: list[dict] = []
@@ -154,7 +147,7 @@ def parse_applications_from_html(html: str, source_label: str = "") -> list[dict
     # ---- Pattern 1: table rows ----
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
-        for row in rows[1:]:  # skip header
+        for row in rows[1:]:
             cells = row.find_all(["td", "th"])
             if len(cells) < 2:
                 continue
@@ -241,10 +234,10 @@ def fetch_via_playwright(dump_html: bool = False) -> list[dict]:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print("[playwright] not installed – skipping strategy 1", file=sys.stderr)
+        print("[playwright] not installed - skipping strategy 1", file=sys.stderr)
         return []
 
-    print("[strategy 1] Fetching weekly report via Playwright …")
+    print("[strategy 1] Fetching weekly report via Playwright ...")
     html = ""
     try:
         with sync_playwright() as pw:
@@ -260,20 +253,19 @@ def fetch_via_playwright(dump_html: bool = False) -> list[dict]:
             page.goto(VIEWER_URL, wait_until="networkidle", timeout=30_000)
 
             # If we land on a login page, try credentials
-            if page.url != VIEWER_URL and "login" in page.url.lower():
+            if "login" in page.url.lower() or "sign" in page.url.lower():
                 username = os.getenv("PORTAL_USERNAME", "")
                 password = os.getenv("PORTAL_PASSWORD", "")
                 if username and password:
-                    print("[strategy 1] Login page detected – attempting login …")
+                    print("[strategy 1] Login page detected - attempting login ...")
                     page.fill('input[type="email"], input[name*="user"], input[name*="email"]', username)
                     page.fill('input[type="password"]', password)
                     page.click('button[type="submit"], input[type="submit"]')
                     page.wait_for_load_state("networkidle", timeout=15_000)
-                    # Navigate back to the viewer after login
                     page.goto(VIEWER_URL, wait_until="networkidle", timeout=30_000)
                 else:
                     print(
-                        "[strategy 1] Login required but no PORTAL_USERNAME/PORTAL_PASSWORD set",
+                        "[strategy 1] Login required but PORTAL_USERNAME/PORTAL_PASSWORD not set",
                         file=sys.stderr,
                     )
 
@@ -297,10 +289,8 @@ def fetch_via_playwright(dump_html: bool = False) -> list[dict]:
 # Strategy 2: GovDelivery bulletin
 # ---------------------------------------------------------------------------
 
-# Known bulletin hex IDs from search results (most recent first).
-# The script tries these and any IDs it can find by searching forward.
 _KNOWN_BULLETIN_IDS = [
-    "3daba2e",  # "Recently registered planning applications Update" (~2025)
+    "3daba2e",  # Recently registered planning applications (~Apr 2025)
     "3b48b44",  # 06 Sep 2024
     "39efbdb",  # 24 May 2024
     "39504e7",  # 05 Apr 2024
@@ -319,12 +309,8 @@ _HEADERS = {
 }
 
 
-def _bulletin_url(hex_id: str) -> str:
-    return _GOVDELIVERY_BASE.format(hex_id)
-
-
 def _fetch_bulletin_html(hex_id: str) -> str | None:
-    url = _bulletin_url(hex_id)
+    url = _GOVDELIVERY_BASE.format(hex_id)
     try:
         r = requests.get(url, headers=_HEADERS, timeout=20)
         if r.ok and "planning" in r.text.lower():
@@ -336,48 +322,30 @@ def _fetch_bulletin_html(hex_id: str) -> str | None:
 
 def _find_latest_bulletin() -> tuple[str | None, str | None]:
     """
-    Return (hex_id, html) for the most recent 'newly registered' planning
-    bulletin we can reach.
-
-    Starts from the most recently known ID and searches forward
-    (incrementing by ~87 000 per week) for up to 200 weeks ahead.
-    Also falls back through the known list.
+    Return (hex_id, html) for the most recent 'newly registered' planning bulletin.
+    Searches forward from the last known ID (~87k increment per week).
     """
-    # Approximate GovDelivery-wide ID increment per week (empirically ~87 000)
     WEEK_INCREMENT = 87_000
-    MAX_WEEKS_AHEAD = 200
-
-    # Start point: most recent known ID
     start_hex = _KNOWN_BULLETIN_IDS[0]
     start_int = int(start_hex, 16)
-
-    # Estimate how many weeks have passed since the start point (~Apr 2025)
-    # so we jump close to the current week first
     start_date = datetime(2025, 4, 1)
     weeks_elapsed = max(0, int((datetime.now() - start_date).days / 7))
 
     candidates: list[int] = []
-
-    # Look around the estimated current position
-    for offset in range(-4, MAX_WEEKS_AHEAD):
+    for offset in range(-4, 200):
         w = weeks_elapsed + offset
         if w < 0:
             continue
         candidates.append(start_int + w * WEEK_INCREMENT)
-
-    # Also add all known IDs
     for known in _KNOWN_BULLETIN_IDS:
         candidates.insert(0, int(known, 16))
-
-    # Remove duplicates and sort descending (newest first)
     candidates = sorted(set(candidates), reverse=True)
 
     for cand_int in candidates:
         hex_id = format(cand_int, "x")
-        print(f"[strategy 2] Trying bulletin {hex_id} …")
+        print(f"[strategy 2] Trying bulletin {hex_id} ...")
         html = _fetch_bulletin_html(hex_id)
         if html:
-            # Confirm it mentions "newly registered" (not "decided")
             lower = html.lower()
             if "newly registered" in lower or "newly+registered" in lower:
                 print(f"[strategy 2] Found matching bulletin: {hex_id}")
@@ -387,11 +355,8 @@ def _find_latest_bulletin() -> tuple[str | None, str | None]:
     return None, None
 
 
-def fetch_via_govdelivery(
-    days_back: int = 14, dump_html: bool = False
-) -> list[dict]:
-    """Fetch the latest North Devon 'newly registered' GovDelivery bulletin."""
-    print("[strategy 2] Searching GovDelivery bulletins …")
+def fetch_via_govdelivery(days_back: int = 14, dump_html: bool = False) -> list[dict]:
+    print("[strategy 2] Searching GovDelivery bulletins ...")
     hex_id, html = _find_latest_bulletin()
 
     if not html:
@@ -404,9 +369,7 @@ def fetch_via_govdelivery(
             fh.write(html)
         print(f"[strategy 2] HTML saved to {fname}")
 
-    apps = parse_applications_from_html(
-        html, source_label=f"bulletin/{hex_id}"
-    )
+    apps = parse_applications_from_html(html, source_label=f"bulletin/{hex_id}")
     print(f"[strategy 2] Parsed {len(apps)} application(s)")
     return apps
 
@@ -424,11 +387,12 @@ def load_seen() -> set[str]:
 
 
 def save_seen(seen: set[str]) -> None:
+    import datetime as dt
     with open(STATE_FILE, "w") as fh:
         json.dump(
             {
                 "seen": sorted(seen),
-                "updated": datetime.now(tz=__import__("datetime").timezone.utc).isoformat(),
+                "updated": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
             },
             fh,
             indent=2,
@@ -491,7 +455,7 @@ def send_email(applications: list[dict]) -> None:
       <th>Reference</th><th>Address</th><th>Distance</th><th>Description</th>
     </tr>
   </thead>
-  <tbody>{"".join(html_rows)}</tbody>
+  <tbody>{chr(10).join(html_rows)}</tbody>
 </table>
 <p style="font-size:12px;color:#777;margin-top:20px">
   <a href="https://planning.northdevon.gov.uk/">North Devon Planning Portal</a>
@@ -511,7 +475,7 @@ def send_email(applications: list[dict]) -> None:
         srv.login(email_from, email_password)
         srv.sendmail(email_from, email_to, msg.as_string())
 
-    print(f"Email sent → {email_to}: {subject}")
+    print(f"Email sent -> {email_to}: {subject}")
 
 
 # ---------------------------------------------------------------------------
@@ -546,9 +510,8 @@ def main() -> None:
     if not all_apps:
         print("No applications fetched from either strategy.")
         print(
-            "Tip: run with --dump-html and check debug_*.html to see what the "
-            "portal returned.  If the viewer requires login, set "
-            "PORTAL_USERNAME and PORTAL_PASSWORD secrets."
+            "Tip: run with --dump-html to see what the portal returned. "
+            "If the viewer requires login, set PORTAL_USERNAME and PORTAL_PASSWORD secrets."
         )
         sys.exit(0)
 
@@ -566,7 +529,7 @@ def main() -> None:
 
         address = app.get("address", "")
         if not address:
-            print(f"  [{ref}] no address – skipping geocode")
+            print(f"  [{ref}] no address - skipping geocode")
             continue
 
         lat, lon = geocode_address(address)
@@ -595,7 +558,7 @@ def main() -> None:
     if nearby:
         send_email(nearby)
     else:
-        print("Nothing nearby – no email sent.")
+        print("Nothing nearby - no email sent.")
 
 
 if __name__ == "__main__":
