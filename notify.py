@@ -525,7 +525,7 @@ def send_email(applications: list[dict]) -> None:
       <th>Reference</th><th>Address</th><th>Distance</th><th>Description</th>
     </tr>
   </thead>
-  <tbody>{""join(html_rows)}</tbody>
+  <tbody>{"".join(html_rows)}</tbody>
 </table>
 <p style="font-size:12px;color:#777;margin-top:20px">
   <a href="https://planning.northdevon.gov.uk/">North Devon Planning Portal</a>
